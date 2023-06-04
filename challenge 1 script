@@ -1,0 +1,172 @@
+## PART 1 chronomics interview
+
+library(readr)
+library(data.table)
+library(ggplot2)
+library(glmnet)
+library(dplyr)
+
+#read files
+series_matrix <- read_tsv("E:\\Chronomics data analysis/GSE40279_series_matrix_SUBSET.txt")
+beta <- read_tsv("E:\\Chronomics data analysis/GSE40279_average_beta.txt")
+
+#create beta matrix
+cpgnames <- beta[[1]]
+beta <- beta[-1]
+rownames(beta) <- cpgnames
+methylation_data <- t(beta)
+methylation_data <- as.data.frame(methylation_data)
+colnames(methylation_data) <- cpgnames
+
+
+####create samplesheet
+samplesheet <- t(series_matrix)
+samplesheet <- samplesheet[,c(1, 7, 9, 12, 13)]
+colnames(samplesheet) <- samplesheet[1,]
+samplesheet <- samplesheet[-1,]
+samplesheet <- as.data.frame(samplesheet)
+rownames(samplesheet) <- samplesheet[[1]]
+samplesheet <- samplesheet[-1]
+
+
+#set column names
+row <- as.character(unlist(samplesheet[1,]))
+split_strings <- strsplit(row, ":")
+column_names <- sapply(split_strings, function(x) x[1])
+column_names[1] <- "Sample ID"
+colnames(samplesheet) <- column_names
+
+#remove 
+samplesheet <- samplesheet %>%
+  mutate_all(~ sub("^[^:]+: ", "", .))
+
+
+## Partition data into 2/3 training set, 1/3 test set
+#trainSet <- caret::createDataPartition(y, p = 0.66, list = FALSE)
+
+
+# Split the data into training and testing sets
+set.seed(123)
+train_indices <- sample(1:nrow(methylation_data), 0.7 * nrow(methylation_data))
+train_data <- methylation_data[train_indices, ]
+test_data <- methylation_data[-train_indices, ]
+train_ages <- samplesheet$`age (y)`[train_indices]
+train_ages <- as.numeric(train_ages)
+test_ages <- as.numeric(samplesheet$`age (y)`[-train_indices])
+
+# Train the Elastic Net model
+cv_model <- cv.glmnet(as.matrix(train_data), train_ages, alpha = 0.5)  # alpha = 0.5 for Elastic Net
+
+
+# model performance: 
+predicted_ages <- predict(cv_model, newx = as.matrix(test_data), s="lambda.min")
+mae <- mean(abs(predicted_ages - test_ages))
+rmse <- sqrt(mean((predicted_ages - test_ages)^2))
+
+ss_total <- sum((test_ages - mean(test_ages))^2)
+ss_residual <- sum((test_ages - predicted_ages)^2)
+r_squared <- 1 - (ss_residual/ss_total)
+correlation <- cor(predicted_ages, test_ages)
+
+
+library(ggplot2)
+
+# Create a data frame with the predicted ages and true ages
+scatter_data <- data.frame(Predicted = predicted_ages, True = test_ages)
+colnames(scatter_data)[1] <- "Predicted"
+
+# Create the scatter plot
+scatter_plot <- ggplot(scatter_data, aes(x = True, y = Predicted)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +  # Add a diagonal line for reference
+  labs(x = "True Age", y = "Predicted Age", title = "True vs Predicted Age") + theme_minimal()
+
+# Display the scatter plot
+print(scatter_plot)
+
+
+# extracting cpg names (variables)
+coefficient <- coef(cv_model, s= "lambda.min")
+length(which(0 != coefficient[,1]))
+inds<- which(coefficient[,1] !=0)
+variables <- row.names(coefficient)[inds][-1]
+coefficient_numbers <- coefficient@x[-1]
+cv_model_variables <- as.data.frame(cbind(variables, coefficient_numbers))
+
+saveRDS(cv_model, "E:\\Chronomics data analysis/Elastic_net_model.rds")
+fwrite(cv_model_variables, "E:\\Chronomics data analysis/Elastic_net_variables.csv")
+
+
+
+
+#######################################################
+#### to compare with nested CV model:
+library(nestedcv)
+set.seed(123)
+
+# filtering 5% most variable probes: 
+cpg_var <- apply(train_data, 2, var)
+threshold <- quantile(cpg_var, probs = 0.95)
+inds <- as.numeric(which(cpg_var > threshold))
+most_variable_probes <- train_data[,inds]
+ages <- as.numeric(samplesheet$`age (y)`)
+
+nested_model <- nestcv.glmnet(y = train_ages, x = most_variable_probes,
+                              family = "gaussian", cv.cores = 3,
+                              alphaSet = seq(0.3, 0.7, 0.1))
+
+nested_model
+saveRDS(nested_model, "E:\\Chronomics data analysis/Nested_model_with_test_dataset.rds")
+
+
+# model performance: 
+predicted_ages <- predict(nested_model, newdata=test_data[,inds])
+mae <- mean(abs(predicted_ages - test_ages))
+rmse <- sqrt(mean((predicted_ages - test_ages)^2))
+
+ss_total <- sum((test_ages - mean(test_ages))^2)
+ss_residual <- sum((test_ages - predicted_ages)^2)
+r_squared <- 1 - (ss_residual/ss_total)
+correlation <- cor(predicted_ages, test_ages)
+# Create a data frame with the predicted ages and true ages
+scatter_data <- data.frame(Predicted = predicted_ages, True = test_ages)
+colnames(scatter_data)[1] <- "Predicted"
+
+# Create the scatter plot
+scatter_plot <- ggplot(scatter_data, aes(x = True, y = Predicted)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +  # Add a diagonal line for reference
+  labs(x = "True Age", y = "Predicted Age", title = "True vs Predicted Age") + theme_minimal()
+
+# Display the scatter plot
+print(scatter_plot)
+
+plot(nested_model$outer_result[[1]]$cvafit)
+
+
+## fewer variables
+# to select a lambda lse with fewer than 30 nonzero coefficients
+nested_model$outer_result[[1]]$cvafit
+# predict using lambda.1se
+predicted_ages_b <- predict(nested_model, newdata=test_data[,inds], s= "lambda.1se")
+mae <- mean(abs(predicted_ages_b - test_ages))
+rmse <- sqrt(mean((predicted_ages - test_ages)^2))
+ss_total <- sum((test_ages - mean(test_ages))^2)
+ss_residual <- sum((test_ages - predicted_ages)^2)
+r_squared <- 1 - (ss_residual/ss_total)
+correlation <- cor(predicted_ages, test_ages)
+# Create a data frame with the predicted ages and true ages
+scatter_data <- data.frame(Predicted = predicted_ages_b, True = test_ages)
+colnames(scatter_data)[1] <- "Predicted"
+
+# Create the scatter plot
+scatter_plot <- ggplot(scatter_data, aes(x = True, y = Predicted)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +  # Add a diagonal line for reference
+  labs(x = "True Age", y = "Predicted Age", title = "True vs Predicted Age") + theme_minimal()
+
+# Display the scatter plot
+print(scatter_plot)
+
+variables <- as.data.frame(coef(nested_model, s="lambda.1se"))
+fwrite(variables, "E://Chronomics data analysis/Nested_model_holdout_lambda1se_variables.csv", row.names = T)
