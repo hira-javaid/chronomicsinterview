@@ -1,0 +1,214 @@
+## PART 2 chronomics interview
+
+library(readr)
+library(data.table)
+library(ChAMP)
+library(ggplot2)
+library(dplyr)
+
+#read files
+series_matrix <- read_tsv("D://OneDrive - Nexus365/Documents/University/Employment/Hurdle Biomarker Consultant/Data analysis/GSE42861_series_matrix_SUBSET.txt", skip=34)
+beta <-  read_tsv("D://OneDrive - Nexus365/Documents/University/Employment/Hurdle Biomarker Consultant/Data analysis/GSE42861_processed_methylation_matrix.txt")
+
+#create beta matrix
+cpgnames <- beta[[1]]
+beta <- beta[,-c(1, 691)]
+rownames(beta) <- cpgnames
+
+####create samplesheet
+samplesheet <- t(series_matrix)
+samplesheet <- samplesheet[,c(1, 10:14)]
+colnames(samplesheet) <- samplesheet[1,]
+samplesheet <- samplesheet[-1,]
+samplesheet <- as.data.frame(samplesheet)
+rownames(samplesheet) <- samplesheet[[1]]
+samplesheet <- samplesheet[-1]
+
+  #set column names
+row <- as.character(unlist(samplesheet[1,]))
+split_strings <- strsplit(row, ":")
+column_names <- sapply(split_strings, function(x) x[1])
+colnames(samplesheet) <- column_names
+  
+  #remove 
+samplesheet <- samplesheet %>%
+  mutate_all(~ sub("^[^:]+: ", "", .))
+
+  #manually checked beta values for GSM colnames and beta columns
+colnames(beta) <- rownames(samplesheet)
+beta <- as.matrix(beta)
+rownames(beta) <- cpgnames
+
+
+## comparing age: 
+patientage <- as.numeric(samplesheet[samplesheet$subject %in% "Patient",3])
+normalage <- as.numeric(samplesheet[samplesheet$subject %in% "Normal",3])
+## Welch Two sample t-test
+mean(patientage)
+mean(normalage)
+t.test(patientage, normalage, var.equal = F)
+#[no significant difference in age]
+a <- cbind(patientage, normalage)
+colnames(a) <- c("Patient", "Normal")
+a <- melt(a)
+library(ggpubr)
+ggplot(a, aes(x=a$Var2, y=a$value, fill=a$Var2)) + geom_boxplot() + stat_compare_means(label.y=80, label.x = 1.25) + theme_bw() + labs(fill="") + ylab("Age") + xlab("")
+
+## comparing gender: 
+cont_table <- table(samplesheet$subject, samplesheet$gender)
+chisq.test(cont_table)
+
+
+# get data ready for methylation analysis
+beta <- as.matrix(beta)
+samplesheet$subject <- as.factor(samplesheet$subject)
+#DMP analysis
+#mydmp <- champ.DMP(beta=beta,pheno=samplesheet$subject, adjPVal = 0.01)
+
+#solve memory issue
+memory.limit(9999999999)
+mydmp <- champ.DMP(beta=beta,pheno=samplesheet$subject, adjPVal = 0.001)
+
+dmp <- mydmp$Patient_to_Normal
+#remove na
+dmp <- dmp[!is.na(dmp$deltaBeta),]
+## saving everything: 
+#fwrite(dmp, "D://OneDrive - Nexus365/Documents/University/Employment/Hurdle Biomarker Consultant/Data analysis/GSE42861_DMPs.csv")
+fwrite(dmp, "D://OneDrive - Nexus365/Documents/University/Employment/Hurdle Biomarker Consultant/Data analysis/GSE42861_DMPs_p001.csv", row.names = T)
+
+
+# no of hypomethylated DMPs: 
+sum(dmp$deltaBeta >0, na.rm=TRUE)
+## hypermethylated DMPs
+sum(dmp$deltaBeta <0, na.rm = TRUE)
+
+#distrubtion of DMPs
+library(shiny)
+CpG.GUI(CpG = rownames(dmp))
+#loss cpgs
+CpG.GUI(CpG=rownames(dmp)[dmp$deltaBeta >0])
+#gain cpgs
+CpG.GUI(CpG=rownames(dmp)[dmp$deltaBeta <0])
+
+
+
+
+
+# gene ontology: 
+library(org.Hs.eg.db)
+b <- dmp[!is.na(dmp$gene),]
+dmp$gene <- as.character(dmp$gene)
+genesentrez <- mapIds(org.Hs.eg.db, dmp$gene, 'ENTREZID', 'SYMBOL')
+element_names <- names(genesentrez)
+element_names <- element_names[!is.na(element_names)]
+
+## gene ontology without filtering
+library(clusterProfiler)
+ego <- enrichGO(element_names, OrgDb = "org.Hs.eg.db", keyType = "SYMBOL", ont = "all", readable=F, pAdjustMethod = "fdr", pvalueCutoff = 0.001)
+dotplot(ego)
+dotplot(ego, split="ONTOLOGY") + facet_grid(ONTOLOGY~., scale="free")
+
+#topDMPs:
+top_dmps <- dmp[dmp$logFC > 0.05 | dmp$logFC < -0.05,]
+genesentrez <- mapIds(org.Hs.eg.db, top_dmps$gene, 'ENTREZID', 'SYMBOL')
+element_names <- names(genesentrez)
+element_names <- element_names[!is.na(element_names)]
+
+## gene ontology
+library(clusterProfiler)
+ego <- enrichGO(element_names, OrgDb = "org.Hs.eg.db", keyType = "SYMBOL", ont = "all", readable=F, pAdjustMethod = "fdr", pvalueCutoff = 0.001)
+dotplot(ego)
+dotplot(ego, split="ONTOLOGY") + facet_grid(ONTOLOGY~., scale="free")
+
+#GSEA: 
+library(missMethyl)
+top_dmps <- dmp[dmp$logFC > 0.1 | dmp$logFC < -0.1,]
+topDMPnames <- rownames(top_dmps)
+gst <- gometh(
+  topDMPnames,
+  collection = c("GO"),
+  array.type = c("450K"))
+# Total number of GO categories significant at 5% FDR
+table(gst$FDR<0.05)
+# Table of top GO results
+fwrite(topGSA(gst), "E:\\Chronomics data analysis/GO of top 65 logFC DMPs.csv")
+
+GSA <- topGSA(gst)
+GSA$Gene_Ratio <- GSA$DE/GSA$N
+GSA <- GSA[order(GSA$DE, decreasing = T),]
+ggplot(GSA, aes(x = Gene_Ratio, y = TERM, color = FDR, size = DE)) + 
+  geom_point(stat = 'identity') + 
+  xlab("ratio") + ylab("") + ggtitle("your data") + 
+  theme_bw() 
+
+
+#
+top_dmps <- dmp[dmp$logFC > 0.05 | dmp$logFC < -0.05,]
+topDMPnames <- rownames(top_dmps)
+gst <- gometh(
+  topDMPnames,
+  collection = c("GO"),
+  array.type = c("450K"))
+# Total number of GO categories significant at 5% FDR
+table(gst$FDR<0.05)
+# Table of top GO results
+View(topGSA(gst))
+fwrite(topGSA(gst), "E:\\Chronomics data analysis/GO of top 5891 logFC DMPs.csv")
+
+
+#all dmps
+gst <- gometh(
+  rownames(dmp),
+  collection = c("GO"),
+  array.type = c("450K"))
+# Total number of GO categories significant at 5% FDR
+View(table(gst$FDR<0.05))
+
+
+DMP_GSEA <- champ.GSEA(DMP=mydmp[[1]], DMR =NULL, beta = beta, pheno = samplesheet$subject)
+DMP_GSEAb <- DMP_GSEA$DMP
+View(DMP_GSEAb)
+
+
+
+
+### heatmap of top DMPs by logFC
+library(pheatmap)
+sorted_df <- dmp[order(dmp$logFC), ]
+top_dmps <- dmp[dmp$logFC > 0.1 | dmp$logFC < -0.1,]
+topDMPnames <- rownames(top_dmps)
+topbeta <- as.data.frame(beta[topDMPnames,])
+topbeta <- as.data.frame(topbeta)
+annot <- as.data.frame(samplesheet[,2])
+rownames(annot) <- rownames(samplesheet)
+colnames(annot) <- c("subject")
+annot$subject <- as.factor(annot$subject)
+pheatmap(topbeta, annotation_col = annot, cluster_rows = T, cluster_cols = T, show_rownames = F, show_colnames = F, clustering_method="mcquitty")
+
+
+##################################################
+## DMR analysis
+betaextract <- beta[c(1:80000),c(1:689)]
+myDMR <- champ.DMR(beta=beta,pheno=samplesheet$subject, method="ProbeLasso", minProbes=20, adjPvalProbe=0.001, minDmrSize=100, minDmrSep=1000, cores=3)
+
+# memory issues thus performing stratified random sampling 
+library(caret)
+my.ids <- createDataPartition(samplesheet$subject, p = 0.25)
+subset <- samplesheet[as.numeric(my.ids[[1]]), ]
+betaextract <- beta[,as.numeric(my.ids[[1]])]
+
+betaextract <- as.matrix(betaextract)
+subset$subject <- as.factor(subset$subject)
+myDMR <- champ.DMR(beta=betaextract,pheno=subset$subject, method="Bumphunter")
+
+DMR.GUI(DMR = myDMR, beta = betaextract, pheno = subset$subject, runDMP = T)
+
+DMR_GSEA <- champ.GSEA(DMR = myDMR, beta = betaextract, pheno = subset$subject, DMP = NULL)
+DMR_GSEAsubset <- DMR_GSEA$DMR
+ggplot(DMR_GSEAsubset, aes(x = fRep, y = Gene_List, color = adjPval, size = nRep)) + 
+  geom_point(stat = 'identity') + 
+  xlab("ratio") + ylab("") + ggtitle("your data") + 
+  theme_bw() + theme(axis.text.y = element_text(angle = 90, vjust = 1, hjust=0.5))
+
+
+
